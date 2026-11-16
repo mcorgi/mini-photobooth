@@ -1,5 +1,4 @@
 """PiTFT single-photo/strip capture, PNG output, and simulated printing."""
-"""PiTFT photobooth with optional live camera and simulated printing."""
 
 import argparse
 from enum import Enum, auto
@@ -10,22 +9,20 @@ from uuid import uuid4
 
 import numpy as np
 import pygame
-from PIL import Image, ImageOps
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 GRAY = (170, 170, 170)
-BUTTON_PINS = [17, 22, 23, 27]
-SHUTTER_PIN = 17
+SHUTTER_PIN = 26
+FILTER_PIN = 17
 RETAKE_PIN = 22
 MODE_PIN = 23
-RETAKE_PIN = 22
-FILTER_PIN = 23
 QUIT_PIN = 27
+BUTTON_PINS = [SHUTTER_PIN, FILTER_PIN, RETAKE_PIN, MODE_PIN, QUIT_PIN]
 FILTER_NAMES = ("Photo", "High Contrast", "Outline", "Invert")
-FILTER_STEPS = len(FILTER_NAMES) + 1  # +1 for "Off"
+FILTER_STEPS = len(FILTER_NAMES) + 1  # Final step is Off.
 DEBOUNCE_SECONDS = 0.05
 FPS = 30
 CAMERA_TIMEOUT_SECONDS = 10.0
@@ -71,9 +68,11 @@ class DebouncedButton:
             return accepted
         return False
 
-# The PiTFT is physically 320x240; 256x192 is close to the practical limit.
+
+# Keep the 192-pixel-tall preview clear of the compact header and footer.
 PREVIEW_SIZE = (256, 192)
-PREVIEW_POS = (32, 32)
+PREVIEW_POS = (32, 24)
+FILTER_TOUCH = (160, 0, 160, 24)
 
 # Default resolutions (recommended for Pi 4 / Pi 5):
 #   --camera-size 1280x960  --live-size 480x360
@@ -94,7 +93,10 @@ OUTLINE_THRESHOLD = 128        # Used only when OUTLINE_DITHER is False
 def parse_size(text):
     """Parse a WxH string into a (width, height) tuple."""
     w, h = text.lower().split("x")
-    return (int(w), int(h))
+    size = (int(w), int(h))
+    if min(size) <= 0:
+        raise ValueError("Image dimensions must be positive")
+    return size
 
 
 def current_filter_name(filter_index):
@@ -143,57 +145,33 @@ def outline_sketch(gray):
     return Image.fromarray(sketch, mode="L")
 
 
-def apply_filter(surface, filter_name):
-    """Create a preview and a 1-bit image for thermal printing.
-
-    filter_name=None means filters are disabled: the preview is the original
-    colour surface, while the printable image still uses default grayscale
-    dithering because the thermal printer only supports 1-bit output.
-    """
-    rgb_bytes = pygame.image.tostring(surface, "RGB")
-    source = Image.frombytes("RGB", surface.get_size(), rgb_bytes)
+def filter_grayscale(source, filter_name):
+    """Apply the partner's image effects before the final monochrome conversion."""
     gray = ImageOps.autocontrast(source.convert("L"))
-    dither = (
-        Image.Dither.FLOYDSTEINBERG
-        if hasattr(Image, "Dither")
-        else Image.FLOYDSTEINBERG
-    )
+    if filter_name == "High Contrast":
+        return ImageEnhance.Contrast(gray).enhance(2.5)
+    if filter_name == "Outline":
+        return outline_sketch(gray)
+    if filter_name == "Invert":
+        return ImageOps.invert(gray)
+    return gray
 
+
+def monochrome(image, filter_name):
+    if filter_name == "Outline" and not OUTLINE_DITHER:
+        return image.point(lambda p: 0 if p < OUTLINE_THRESHOLD else 255, mode="1")
+    return image.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+
+
+def apply_filter(surface, filter_name):
+    """Return the live preview and the corresponding 1-bit print image."""
+    source = Image.frombytes("RGB", surface.get_size(), pygame.image.tostring(surface, "RGB"))
+    gray = filter_grayscale(source, filter_name)
+    result = monochrome(gray, filter_name)
     if filter_name is None:
-        result = gray.convert("1", dither=dither)
         return surface.copy(), result
-
-    if filter_name == "Photo":
-        result = gray.convert("1", dither=dither)
-    elif filter_name == "High Contrast":
-        contrast = ImageEnhance.Contrast(gray).enhance(2.5)
-        result = contrast.convert("1", dither=dither)
-    elif filter_name == "Outline":
-        sketch = outline_sketch(gray)
-        if OUTLINE_DITHER:
-            # Soft pencil look: the 1-bit print approximates the gray sketch.
-            result = sketch.convert("1", dither=dither)
-        else:
-            # Hard binary lines: sharp but less forgiving of noise.
-            result = sketch.point(
-                lambda p: 0 if p < OUTLINE_THRESHOLD else 255,
-                mode="1",
-            )
-        # Preview the grayscale sketch, not the 1-bit print image.
-        preview_image = sketch.convert("RGB")
-        preview = pygame.image.fromstring(
-            preview_image.tobytes(), preview_image.size, "RGB"
-        ).copy()
-        return preview, result
-    elif filter_name == "Invert":
-        result = ImageOps.invert(gray).convert("1", dither=dither)
-    else:
-        result = gray.convert("1", dither=dither)
-
-    preview_image = result.convert("RGB")
-    preview = pygame.image.fromstring(
-        preview_image.tobytes(), preview_image.size, "RGB"
-    ).copy()
+    preview_image = (gray if filter_name == "Outline" else result).convert("RGB")
+    preview = pygame.image.fromstring(preview_image.tobytes(), preview_image.size, "RGB").copy()
     return preview, result
 
 
@@ -203,33 +181,49 @@ class State(Enum):
     CAPTURING = auto()
     PROCESSING = auto()
     REVIEW = auto()
-    REVIEW = auto()
     PRINTING = auto()
 
 
-def compose_output(photos, mode):
-    """Compose grayscale first; dither the completed print image exactly once."""
+def compose_image(photos, mode, filter_name=None, color=False):
+    """Compose continuous-tone tiles, retaining color for the Off review preview."""
     if len(photos) != mode.count:
         raise ValueError("Incorrect photo count for selected mode")
+    photos = [photo.convert("RGB") if color else filter_grayscale(photo, filter_name)
+              for photo in photos]
     if mode == PhotoMode.SINGLE_PHOTO:
-        photo = photos[0].convert("L")
-        image = photo.resize((384, max(1, round(photo.height * 384 / photo.width))))
+        photo = photos[0]
+        image = photo.resize((384, max(1, round(photo.height * 384 / photo.width))),
+                             Image.Resampling.LANCZOS)
     else:
         margin, gap = 8, 8
         width, height = 368, 276  # Identical centered 4:3 crops.
-        image = Image.new("L", (384, 2 * margin + 4 * height + 3 * gap), 255)
+        image = Image.new("RGB" if color else "L",
+                          (384, 2 * margin + 4 * height + 3 * gap), "white")
         for index, photo in enumerate(photos):
-            crop = ImageOps.fit(photo.convert("L"), (width, height))
+            crop = ImageOps.fit(photo, (width, height), method=Image.Resampling.LANCZOS)
             image.paste(crop, (margin, margin + index * (height + gap)))
-    return image.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+    return image
 
 
-def save_output(photos, mode, output_dir):
+def compose_output(photos, mode, filter_name=None):
+    """Dither the completed printer image once, after resizing and composition."""
+    return monochrome(compose_image(photos, mode, filter_name), filter_name)
+
+
+def make_review_preview(photos, mode, filter_name=None):
+    # Resizing 1-bit printer dots for the tiny display causes aliasing. Review
+    # continuous tones instead; Off preserves color. The saved print PNG stays 1-bit.
+    image = compose_image(photos, mode, filter_name, color=filter_name is None)
+    image = ImageOps.contain(image, PREVIEW_SIZE, Image.Resampling.LANCZOS).convert("RGB")
+    return pygame.image.fromstring(image.tobytes(), image.size, "RGB").copy()
+
+
+def save_output(photos, mode, output_dir, filter_name=None, path=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
+    path = path or output_dir / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
                          + ("-strip.png" if mode == PhotoMode.PHOTO_STRIP else "-single.png"))
-    compose_output(photos, mode).save(path)
+    compose_output(photos, mode, filter_name).save(path)
     return path
 
 
@@ -260,6 +254,13 @@ class Session:
         print("Session failed:", self.error)
 
     def advance(self, now, shutter=False, retake=False, mode=False):
+        if retake and self.state in (State.COUNTDOWN, State.CAPTURING,
+                                     State.PROCESSING, State.PRINTING):
+            self.photos.clear()
+            self.output_path = None
+            self.error = None
+            self.enter(State.IDLE, now)
+            return
         elapsed = now - self.state_started
         if self.state == State.IDLE:
             if mode:
@@ -292,6 +293,59 @@ class Session:
             self.enter(State.IDLE, now)
 
 
+def draw_ui(screen, session, filter_index, image, font_small, font_message,
+            font_countdown, now, camera_failed=False):
+    """Reserve the header/footer for labels; leave the live image unobstructed."""
+    screen.fill(BLACK)
+    if image is not None:
+        rect = image.get_rect().fit(pygame.Rect(PREVIEW_POS, PREVIEW_SIZE))
+        screen.blit(pygame.transform.smoothscale(image, rect.size), rect)
+
+    header = (24, 24, 24)
+    pygame.draw.rect(screen, header, (0, 0, 320, 24))
+    mode = "Single Photo" if session.selected_mode == PhotoMode.SINGLE_PHOTO else "Strip (4)"
+    label = font_small.render("Mode: " + mode, True, WHITE)
+    screen.blit(label, label.get_rect(midleft=(8, 12)))
+    label = font_small.render("Filter: " + filter_label(filter_index), True, GRAY)
+    screen.blit(label, label.get_rect(midright=(312, 12)))
+
+    state = session.state
+    elapsed = now - session.state_started
+    message = None
+    status = "Ready"
+    if state == State.COUNTDOWN:
+        message = str(max(1, 3 - int(elapsed)))
+        status = "Photo {} of {}   22: stop".format(len(session.photos) + 1, session.selected_mode.count)
+    elif state == State.CAPTURING:
+        status = "Capturing {} of {}   22: stop".format(len(session.photos) + 1, session.selected_mode.count)
+    elif state == State.PROCESSING:
+        message = "Processing..."
+        status = "Making your photo strip" if session.selected_mode == PhotoMode.PHOTO_STRIP else "Preparing photo"
+    elif state == State.REVIEW:
+        status = "Shutter: continue    Retake: retry"
+    elif state == State.PRINTING:
+        message = "Printing..."
+        status = "Print simulation"
+    elif camera_failed:
+        message = "Camera unavailable"
+        status = "Restart the application"
+    elif session.error:
+        message = "Photo failed"
+        status = "Press shutter to retry"
+    elif image is None:
+        message = "Ready!"
+
+    # Only transient countdowns and busy/error messages cover the preview.
+    if message is not None:
+        font = font_countdown if state == State.COUNTDOWN else font_message
+        text = font.render(message, True, WHITE)
+        rect = text.get_rect(center=(160, 120))
+        pygame.draw.rect(screen, BLACK, rect.inflate(16, 8), border_radius=6)
+        screen.blit(text, rect)
+    text = font_small.render(status, True, GRAY)
+    screen.blit(text, text.get_rect(center=(160, 228)))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -304,34 +358,19 @@ def main():
     )
     parser.add_argument("--output-dir", default=str(Path(__file__).parent / "output"),
                         help="directory for completed monochrome PNGs")
-        help="use a desktop window and keyboard instead of PiTFT/GPIO",
-    )
-    parser.add_argument(
-        "--camera", action="store_true",
-        help="use the Pi camera for live preview and an in-memory photo",
-    )
-    parser.add_argument(
-        "--camera-size", default=DEFAULT_CAMERA_SIZE,
-        help=(
-            "camera capture resolution WxH, e.g. 1280x960 (Pi 4/5), "
-            "640x480 (Pi Zero 2 W). Default: " + DEFAULT_CAMERA_SIZE
-        ),
-    )
-    parser.add_argument(
-        "--live-size", default=DEFAULT_LIVE_SIZE,
-        help=(
-            "live preview processing resolution WxH, e.g. 480x360 or 320x240. "
-            "Default: " + DEFAULT_LIVE_SIZE
-        ),
-    )
+    parser.add_argument("--camera-size", default=DEFAULT_CAMERA_SIZE,
+                        help="capture resolution WxH (default: %(default)s)")
+    parser.add_argument("--live-size", default=DEFAULT_LIVE_SIZE,
+                        help="live filter resolution WxH (default: %(default)s)")
     args = parser.parse_args()
-
-    camera_size = parse_size(args.camera_size)
-    live_size = parse_size(args.live_size)
+    try:
+        camera_size = parse_size(args.camera_size)
+        live_size = parse_size(args.live_size)
+    except (ValueError, TypeError):
+        parser.error("--camera-size and --live-size must be positive WxH values")
 
     GPIO = None
     pitft = None
-    camera = None
     camera = None
 
     try:
@@ -352,7 +391,7 @@ def main():
         if not args.desktop:
             pitft = pigame.PiTft()
             # Poll edge flags on the UI thread; no callbacks mutate app state.
-            for pin in (SHUTTER_PIN, RETAKE_PIN, MODE_PIN):
+            for pin in (SHUTTER_PIN, FILTER_PIN, RETAKE_PIN, MODE_PIN):
                 GPIO.add_event_detect(pin, GPIO.FALLING, bouncetime=50)
 
         screen = pygame.display.set_mode((320, 240))
@@ -360,38 +399,10 @@ def main():
         pygame.mouse.set_visible(False)
         font_title = pygame.font.Font(None, 30)
         font_message = pygame.font.Font(None, 30)
-        font_small = pygame.font.Font(None, 21)
+        font_small = pygame.font.Font(None, 18)
         font_countdown = pygame.font.Font(None, 88)
         clock = pygame.time.Clock()
 
-        if args.camera:
-            from picamera2 import Picamera2
-            from libcamera import controls
-
-            camera = Picamera2()
-            config = camera.create_preview_configuration(
-                # Picamera2 BGR888 produces RGB byte order for Pygame.
-                main={"size": (320, 240), "format": "BGR888"},
-                controls={"AfMode": controls.AfModeEnum.Continuous},
-                queue=False,
-            )
-            camera.configure(config)
-            camera.start(show_preview=False)
-
-        live_frame = None
-        review_photo = None
-        frame_job = None
-        frame_job_started = None
-        job_is_photo = False
-        camera_failed = False
-        session = Session(time.monotonic())
-        action_pins = (SHUTTER_PIN, RETAKE_PIN, MODE_PIN)
-        buttons = {
-            pin: DebouncedButton(False if GPIO is None else GPIO.input(pin) == GPIO.LOW,
-                                 session.state_started)
-            for pin in action_pins
-        }
-        keys_down = set()
         if args.camera:
             from picamera2 import Picamera2
             from libcamera import controls
@@ -408,22 +419,27 @@ def main():
 
         live_frame = None
         live_filtered_frame = None
-        photo = None
-        filtered_photo = None
-        print_photo = None
-        # 0..len(FILTER_NAMES)-1 are filters; len(FILTER_NAMES) means Off.
         filter_index = 0
+        filter_touch = pygame.Rect(FILTER_TOUCH)
+        review_photo = None
         frame_job = None
+        frame_job_started = None
         job_is_photo = False
-        state = State.IDLE
-        state_started = time.monotonic()
-        action_pins = (SHUTTER_PIN, RETAKE_PIN, FILTER_PIN)
-        raw_pressed = {
-            pin: False if GPIO is None else GPIO.input(pin) == GPIO.LOW
+        camera_failed = False
+        session = Session(time.monotonic())
+        action_pins = (SHUTTER_PIN, FILTER_PIN, RETAKE_PIN, MODE_PIN)
+        button_states = {
+            SHUTTER_PIN: (State.IDLE, State.REVIEW),
+            FILTER_PIN: (State.IDLE, State.COUNTDOWN, State.REVIEW),
+            RETAKE_PIN: (State.COUNTDOWN, State.CAPTURING, State.PROCESSING,
+                         State.REVIEW, State.PRINTING),
+            MODE_PIN: (State.IDLE,),
+        }
+        buttons = {
+            pin: DebouncedButton(False if GPIO is None else GPIO.input(pin) == GPIO.LOW,
+                                 session.state_started)
             for pin in action_pins
         }
-        stable_pressed = raw_pressed.copy()
-        button_changed = {pin: state_started for pin in action_pins}
         keys_down = set()
         running = True
 
@@ -435,9 +451,7 @@ def main():
             shutter_pressed = False
             retake_pressed = False
             mode_pressed = False
-            retake_pressed = False
             filter_pressed = False
-
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -452,18 +466,13 @@ def main():
                             retake_pressed = True
                         elif event.key == pygame.K_m:
                             mode_pressed = True
-                elif event.type == pygame.KEYUP:
-                    keys_down.discard(event.key)
-                    elif event.key not in keys_down:
-                        keys_down.add(event.key)
-                        if event.key == pygame.K_SPACE:
-                            shutter_pressed = True
-                        elif event.key == pygame.K_r:
-                            retake_pressed = True
                         elif event.key == pygame.K_f:
                             filter_pressed = True
                 elif event.type == pygame.KEYUP:
                     keys_down.discard(event.key)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if filter_touch.collidepoint(event.pos):
+                        filter_pressed = True
 
             if GPIO is not None:
                 if GPIO.input(QUIT_PIN) == GPIO.LOW:
@@ -471,38 +480,38 @@ def main():
 
                 presses = {}
                 for pin in action_pins:
-                    eligible = (session.state == State.IDLE if pin == MODE_PIN
-                                else session.state in (State.IDLE, State.REVIEW))
+                    eligible = session.state in button_states[pin]
                     presses[pin] = buttons[pin].update(
                         GPIO.input(pin) == GPIO.LOW, now,
                         GPIO.event_detected(pin), eligible,
                     )
                 shutter_pressed |= presses[SHUTTER_PIN]
+                filter_pressed |= presses[FILTER_PIN]
                 retake_pressed |= presses[RETAKE_PIN]
                 mode_pressed |= presses[MODE_PIN]
-                # Accept a new edge only after the input is stable for 50 ms.
-                for pin in action_pins:
-                    pressed = GPIO.input(pin) == GPIO.LOW
-                    if pressed != raw_pressed[pin]:
-                        raw_pressed[pin] = pressed
-                        button_changed[pin] = now
-                    if now - button_changed[pin] >= DEBOUNCE_SECONDS:
-                        if raw_pressed[pin] != stable_pressed[pin]:
-                            stable_pressed[pin] = raw_pressed[pin]
-                            if stable_pressed[pin]:
-                                if pin == SHUTTER_PIN:
-                                    shutter_pressed = True
-                                elif pin == RETAKE_PIN:
-                                    retake_pressed = True
-                                else:
-                                    filter_pressed = True
 
             if not running:
                 break
 
+            # Cancel before polling/saving, so a stop press cannot finish a photo.
+            # Drain any outstanding camera job as a preview; never start a second
+            # request over it or reuse its photo in the next session.
+            if retake_pressed and session.state in (State.COUNTDOWN, State.CAPTURING,
+                                                    State.PROCESSING, State.PRINTING):
+                session.advance(now, retake=True)
+                job_is_photo = False
+                review_photo = None
+                shutter_pressed = retake_pressed = mode_pressed = filter_pressed = False
+
             state = session.state
             camera_timed_out = False
             try:
+                filter_changed = filter_pressed and state in (State.IDLE, State.COUNTDOWN, State.REVIEW)
+                if filter_changed:
+                    filter_index = (filter_index + 1) % FILTER_STEPS
+                    if live_frame is not None:
+                        live_filtered_frame, _ = apply_filter(live_frame, current_filter_name(filter_index))
+
                 # Poll one camera job without waiting, so quit/buttons still work.
                 if frame_job is not None:
                     try:
@@ -513,12 +522,13 @@ def main():
                             raise RuntimeError("Camera timed out; restart with --camera")
                     else:
                         frame = pygame.image.frombuffer(
-                            array.tobytes(), (320, 240), "RGB"
+                            array.tobytes(), camera_size, "RGB"
                         ).copy()
                         if job_is_photo:
                             session.photo = frame
                         else:
-                            live_frame = frame
+                            live_frame = pygame.transform.smoothscale(frame, live_size)
+                            live_filtered_frame, _ = apply_filter(live_frame, current_filter_name(filter_index))
                         frame_job = None
 
                 needs_photo = state == State.CAPTURING and session.photo is None
@@ -536,12 +546,16 @@ def main():
                     label = font_title.render("Sample photo " + str(len(session.photos) + 1),
                                               True, BLACK)
                     session.photo.blit(label, (60, 100))
-                if state == State.PROCESSING and session.output_path is None:
+                if ((state == State.PROCESSING and session.output_path is None)
+                        or (state == State.REVIEW and filter_changed)):
                     photos = [Image.frombytes("RGB", photo.get_size(),
                               pygame.image.tostring(photo, "RGB")) for photo in session.photos]
-                    session.output_path = save_output(photos, session.selected_mode, args.output_dir)
-                    review_photo = (session.photo if session.selected_mode == PhotoMode.SINGLE_PHOTO
-                                    else pygame.image.load(str(session.output_path)))
+                    session.output_path = save_output(
+                        photos, session.selected_mode, args.output_dir,
+                        current_filter_name(filter_index), session.output_path,
+                    )
+                    review_photo = make_review_preview(
+                        photos, session.selected_mode, current_filter_name(filter_index))
                     print("Saved:", session.output_path)
             except Exception as error:
                 # A failed session must never reach REVIEW/PRINTING with stale photos.
@@ -563,257 +577,17 @@ def main():
             session.advance(now, shutter_pressed and not camera_failed, retake_pressed, mode_pressed)
             state = session.state
 
-            elapsed = now - session.state_started
-            if camera is not None:
-                # Poll one camera job without waiting, so quit/buttons still work.
-                if frame_job is not None:
-                    try:
-                        array = frame_job.get_result(timeout=0)
-                    except TimeoutError:
-                        pass
-                    else:
-                        frame = pygame.image.frombuffer(
-                            array.tobytes(), camera_size, "RGB"
-                        ).copy()
-                        if job_is_photo:
-                            # Full-resolution photo for review and printing.
-                            photo = frame
-                            filtered_photo = None
-                            print_photo = None
-                        else:
-                            # Downsample the live preview for speed; the
-                            # result is still larger than the 256x192
-                            # preview area, so no visible detail is lost.
-                            live_frame = pygame.transform.smoothscale(
-                                frame, live_size
-                            )
-                            live_filtered_frame, _ = apply_filter(
-                                live_frame, current_filter_name(filter_index)
-                            )
-                        frame_job = None
-
-                needs_photo = state == State.CAPTURING and photo is None
-                if frame_job is None and (
-                    state in (State.IDLE, State.COUNTDOWN) or needs_photo
-                ):
-                    job_is_photo = needs_photo
-                    frame_job = camera.capture_array("main", wait=False)
-
-            # GPIO23 / F cycles through the filters and the final "Off" step.
-            # The selection is kept through countdown and review.
-            if filter_pressed and state in (
-                State.IDLE, State.COUNTDOWN, State.REVIEW
-            ):
-                filter_index = (filter_index + 1) % FILTER_STEPS
-                if live_frame is not None:
-                    live_filtered_frame, _ = apply_filter(
-                        live_frame, current_filter_name(filter_index)
-                    )
-                if state == State.REVIEW and photo is not None:
-                    filtered_photo, print_photo = apply_filter(
-                        photo, current_filter_name(filter_index)
-                    )
-                print("Filter:", filter_label(filter_index))
-
-            # Consume presses every frame; only IDLE and REVIEW start actions.
-            next_state = state
-            elapsed = now - state_started
-            if state == State.IDLE:
-                if shutter_pressed:
-                    next_state = State.COUNTDOWN
-            elif state == State.COUNTDOWN:
-                if elapsed >= 3.0:
-                    next_state = State.CAPTURING
-            elif state == State.CAPTURING:
-                if elapsed >= 1.0 and (camera is None or photo is not None):
-                    next_state = State.PROCESSING
-            elif state == State.PROCESSING:
-                if elapsed >= 1.0:
-                    next_state = State.REVIEW
-            elif state == State.REVIEW:
-                # Retake wins; filter changes were handled above.
-                if retake_pressed:
-                    next_state = State.COUNTDOWN
-                elif shutter_pressed:
-                    next_state = State.PRINTING
-            elif state == State.PRINTING:
-                if elapsed >= 2.0:
-                    next_state = State.IDLE
-
-            # Reset the timer on entry; never wait inside a state.
-            if next_state != state:
-                state = next_state
-                state_started = now
-                if state == State.IDLE:
-                    photo = None
-                    filtered_photo = None
-                    print_photo = None
-                    filter_index = 0
-                    if live_frame is not None:
-                        live_filtered_frame, _ = apply_filter(
-                            live_frame, current_filter_name(filter_index)
-                        )
-                elif state == State.COUNTDOWN:
-                    photo = None
-                    filtered_photo = None
-                    print_photo = None
-                elif state == State.REVIEW and photo is not None:
-                    filtered_photo, print_photo = apply_filter(
-                        photo, current_filter_name(filter_index)
-                    )
-                elif state == State.PRINTING and print_photo is not None:
-                    # Saves to the current working directory; overwrites
-                    # the previous file each time.
-                    print_photo.save("photo_for_printing.png")
-                    print(
-                        "Saved: photo_for_printing.png "
-                        "(" + str(print_photo.size[0]) + "x"
-                        + str(print_photo.size[1]) + ")"
-                    )
-                print("State:", state.name)
-
-            elapsed = now - state_started
-            if state == State.IDLE:
-                message = "Camera unavailable" if camera_failed else "Ready!"
-                detail = ("Restart with --camera" if camera_failed
-                          else "GPIO17/SPACE: Start  GPIO23/M: Mode")
-                message = "Ready!"
-                detail = (
-                    "SPACE: Capture | F: Filter"
-                    if args.desktop
-                    else "GPIO17: Capture | GPIO23: Filter"
-                )
-            elif state == State.COUNTDOWN:
-                message = str(max(1, 3 - int(elapsed)))
-                detail = "Photo {} of {} - Smile!".format(
-                    len(session.photos) + 1, session.selected_mode.count)
-            elif state == State.REVIEW:
-                message = "Retake or continue?"
-                detail = "GPIO17 / SPACE: Continue"
-                detail = "Smile for your photo!"
-            elif state == State.REVIEW:
-                message = "Filter: " + filter_label(filter_index)
-                detail = "GPIO23 / F: Change filter"
-            else:
-                message = {
-                    State.CAPTURING: "Capturing...",
-                    State.PROCESSING: "Processing...",
-                    State.PRINTING: "Printing...",
-                }[state]
-                detail = ("Photo {} of {}".format(len(session.photos) + 1, session.selected_mode.count)
-                          if state == State.CAPTURING else
-                          "Print simulation" if state == State.PRINTING else "Please wait")
-
-            screen.fill(BLACK)
-            if camera is not None:
-                image = (live_frame if state in (State.IDLE, State.COUNTDOWN)
-                         else review_photo if state in (State.REVIEW, State.PRINTING)
-                         else session.photo)
-                if image is not None:
-                    rect = image.get_rect().fit(pygame.Rect(64, 48, 192, 144))
-                    preview = pygame.transform.scale(image, rect.size)
-                    screen.blit(preview, rect)
-            if camera is not None:
-                if state in (State.IDLE, State.COUNTDOWN):
-                    image = live_filtered_frame
-                elif state in (State.REVIEW, State.PRINTING) and filtered_photo is not None:
-                    image = filtered_photo
-                else:
-                    image = photo
-                if image is not None:
-                    preview = pygame.transform.smoothscale(image, PREVIEW_SIZE)
-                    screen.blit(preview, PREVIEW_POS)
-
-            title = font_title.render("MINI PHOTOBOOTH", True, WHITE)
-            screen.blit(title, title.get_rect(center=(160, 18 if args.camera else 28)))
-            if not args.camera:
-                pygame.draw.line(screen, GRAY, (20, 50), (300, 50))
-            mode_text = font_small.render("Mode: " + session.selected_mode.value, True, WHITE)
-            # A fixed band remains legible over the live camera preview.
-            pygame.draw.rect(screen, BLACK, (0, 54, 320, 20))
-            screen.blit(mode_text, mode_text.get_rect(center=(160, 64)))
-            screen.blit(title, title.get_rect(center=(160, 16 if args.camera else 28)))
-
-            if args.camera and state in (State.IDLE, State.COUNTDOWN):
-                filter_text = font_small.render(
-                    "Filter: " + filter_label(filter_index), True, WHITE
-                )
-                filter_rect = filter_text.get_rect(center=(160, 30))
-                pygame.draw.rect(screen, BLACK, filter_rect.inflate(8, 4))
-                screen.blit(filter_text, filter_rect)
-
-            if not args.camera:
-                pygame.draw.line(screen, GRAY, (20, 50), (300, 50))
-
-            font = font_countdown if state == State.COUNTDOWN else font_message
-            if args.camera and state == State.REVIEW:
-                text = font_small.render(message, True, WHITE)
-                screen.blit(text, text.get_rect(center=(160, 37)))
-            elif not args.camera or state != State.IDLE:
-                text = font.render(message, True, WHITE)
-                text_rect = text.get_rect(center=(160, 110))
-                pygame.draw.rect(screen, BLACK, text_rect.inflate(8, 4))
-                screen.blit(text, text_rect)
-            if args.camera and state == State.REVIEW:
-                text = font_small.render(message, True, WHITE)
-                text_rect = text.get_rect(center=(160, 30))
-                pygame.draw.rect(screen, BLACK, text_rect.inflate(8, 4))
-                screen.blit(text, text_rect)
-            elif not args.camera or state != State.IDLE:
-                text = font.render(message, True, WHITE)
-                text_rect = text.get_rect(center=(160, 128 if args.camera else 110))
-                pygame.draw.rect(screen, BLACK, text_rect.inflate(8, 4))
-                screen.blit(text, text_rect)
-
-            text = font_small.render(detail, True, WHITE)
-            screen.blit(text, text.get_rect(center=(160, 201 if args.camera else 170)))
-            if state == State.IDLE and session.error:
-                error_hint = ("Camera timed out - restart application" if camera_failed
-                              else "Session failed - see terminal; retry")
-                text = font_small.render(error_hint, True, WHITE)
-                screen.blit(text, text.get_rect(center=(160, 218 if args.camera else 191)))
-            if state == State.REVIEW:
-                text = font_small.render("GPIO22 / R: Retake", True, WHITE)
-                screen.blit(text, text.get_rect(center=(160, 218 if args.camera else 191)))
-            text_rect = text.get_rect(center=(160, 212 if args.camera else 170))
-            pygame.draw.rect(screen, BLACK, text_rect.inflate(8, 4))
-            screen.blit(text, text_rect)
-
-            if state == State.REVIEW:
-                text = font_small.render(
-                    "GPIO17: Print | GPIO22: Retake", True, WHITE
-                )
-                text_rect = text.get_rect(center=(160, 226 if args.camera else 191))
-                pygame.draw.rect(screen, BLACK, text_rect.inflate(8, 4))
-                screen.blit(text, text_rect)
-
-            footer = "ESC / Q: quit" if args.desktop else "GPIO27 / ESC / Q: quit"
-            text = font_small.render(footer, True, GRAY)
-            screen.blit(text, text.get_rect(center=(160, 232 if args.camera else 219)))
-            text_rect = text.get_rect(center=(160, 232))
-            pygame.draw.rect(screen, BLACK, text_rect.inflate(8, 4))
-            screen.blit(text, text_rect)
-
+            image = (live_filtered_frame if state in (State.IDLE, State.COUNTDOWN)
+                     else review_photo if state in (State.REVIEW, State.PRINTING)
+                     else session.photo)
+            draw_ui(screen, session, filter_index, image, font_small, font_message,
+                    font_countdown, now, camera_failed)
             pygame.display.flip()
             clock.tick(FPS)
 
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            if camera is not None:
-                camera.close()
-        finally:
-            # The lab's pigame destructor stops its touchscreen helper.
-            try:
-                if pitft is not None:
-                    del pitft
-            finally:
-                try:
-                    if GPIO is not None:
-                        GPIO.cleanup()
-                finally:
-                    pygame.quit()
         try:
             if camera is not None:
                 camera.close()

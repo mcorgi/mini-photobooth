@@ -80,7 +80,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(session.state, State.COUNTDOWN)
             session.advance(tick + 2.99, shutter=True, mode=True)
             self.assertEqual(session.state, State.COUNTDOWN)
-            session.advance(tick + 3.)
+            session.advance(tick + 3.001)
             self.assertEqual(session.state, State.CAPTURING)
             session.advance(tick + 4.)  # Wait for a real photo; time alone cannot capture.
             self.assertEqual(session.state, State.CAPTURING)
@@ -126,8 +126,57 @@ class SessionTests(unittest.TestCase):
         self.run_capture(session, 6.)
         self.assertIsNone(session.error)
 
+    def test_stop_returns_idle_clears_photos_and_preserves_mode(self):
+        for state in (State.COUNTDOWN, State.CAPTURING, State.PROCESSING, State.PRINTING):
+            with self.subTest(state=state):
+                session = Session(0)
+                session.selected_mode = PhotoMode.PHOTO_STRIP
+                session.enter(state, 1)
+                session.photos = [object()]
+                session.photo = object()
+                session.advance(2, retake=True, shutter=True, mode=True)
+                self.assertEqual(session.state, State.IDLE)
+                self.assertEqual(session.photos, [])
+                self.assertIsNone(session.photo)
+                self.assertIsNone(session.output_path)
+                self.assertEqual(session.selected_mode, PhotoMode.PHOTO_STRIP)
+                self.run_capture(session, 3)
+
 
 class OutputTests(unittest.TestCase):
+    def test_review_is_continuous_tone_and_off_preserves_color(self):
+        photo = Image.new("RGB", (320, 240), (180, 100, 60))
+        preview = photobooth.make_review_preview([photo] * 4, PhotoMode.PHOTO_STRIP)
+        self.assertEqual(preview.get_size(), (64, 192))
+        color = preview.get_at((32, 24))
+        self.assertGreater(color.r, color.g)
+        self.assertGreater(color.g, color.b)
+        preview = photobooth.make_review_preview([photo] * 4, PhotoMode.PHOTO_STRIP, "Photo")
+        color = preview.get_at((32, 24))
+        self.assertEqual(color.r, color.g)
+        self.assertEqual(color.g, color.b)
+        self.assertGreater(color.r, 0)
+        self.assertLess(color.r, 255)
+        self.assertEqual(compose_output([photo] * 4, PhotoMode.PHOTO_STRIP).mode, "1")
+
+    def test_filters_preserve_source_and_compose_printable_strip(self):
+        surface = pygame.Surface((64, 48))
+        for x in range(64):
+            pygame.draw.line(surface, (x * 4, x * 3, x * 2), (x, 0), (x, 47))
+        original = pygame.image.tostring(surface, "RGB")
+        photo = Image.frombytes("RGB", surface.get_size(), original)
+        for name in (*photobooth.FILTER_NAMES, None):
+            with self.subTest(filter=name):
+                preview, printable = photobooth.apply_filter(surface, name)
+                self.assertEqual(preview.get_size(), surface.get_size())
+                self.assertEqual(printable.mode, "1")
+                strip = compose_output([photo] * 4, PhotoMode.PHOTO_STRIP, name)
+                self.assertEqual(strip.size, (384, 1144))
+                self.assertEqual(strip.mode, "1")
+        self.assertEqual(pygame.image.tostring(surface, "RGB"), original)
+        self.assertNotEqual(compose_output([photo], PhotoMode.SINGLE_PHOTO, "Photo").tobytes(),
+                            compose_output([photo], PhotoMode.SINGLE_PHOTO, "Invert").tobytes())
+
     def test_strip_size_order_margins_and_monochrome(self):
         photos = [Image.new("RGB", size, (gray, gray, gray))
                   for size, gray in zip([(500, 200), (320, 240), (200, 500), (800, 600)],
@@ -157,14 +206,16 @@ class OutputTests(unittest.TestCase):
 
 class LoopTests(unittest.TestCase):
     def test_async_camera_capture_counts_and_retry_after_driver_error(self):
-        for mode, fail_once, stall in [(PhotoMode.SINGLE_PHOTO, False, False),
-                                       (PhotoMode.PHOTO_STRIP, False, False),
-                                       (PhotoMode.PHOTO_STRIP, True, False),
-                                       (PhotoMode.SINGLE_PHOTO, False, True)]:
-            with self.subTest(mode=mode, fail_once=fail_once, stall=stall):
+        for mode, fail_once, stall, cancel in [(PhotoMode.SINGLE_PHOTO, False, False, False),
+                                              (PhotoMode.PHOTO_STRIP, False, False, False),
+                                              (PhotoMode.PHOTO_STRIP, True, False, False),
+                                              (PhotoMode.SINGLE_PHOTO, False, True, False),
+                                              (PhotoMode.PHOTO_STRIP, False, False, True)]:
+            with self.subTest(mode=mode, fail_once=fail_once, stall=stall, cancel=cancel):
                 now, sessions, requests = [0.], [], []
                 started, completed = [False], [False]
                 failed = [False]
+                cancelled = [False]
 
                 def create_session(tick):
                     session = Session(tick)
@@ -172,8 +223,9 @@ class LoopTests(unittest.TestCase):
                     return session
 
                 class Job:
-                    def __init__(self, photo):
+                    def __init__(self, photo, size):
                         self.photo, self.polled = photo, False
+                        self.size = size
 
                     def get_result(self, timeout):
                         self_test.assertEqual(timeout, 0)
@@ -185,14 +237,16 @@ class LoopTests(unittest.TestCase):
                         if self.photo and fail_once and not failed[0]:
                             failed[0] = True
                             raise OSError("injected camera error")
-                        return SimpleNamespace(tobytes=lambda: bytes([85, 170, 255]) * (320 * 240))
+                        return SimpleNamespace(tobytes=lambda: bytes([85, 170, 255])
+                                               * (self.size[0] * self.size[1]))
 
                 class Camera:
                     def create_preview_configuration(self, **kwargs):
                         return kwargs
 
                     def configure(self, config):
-                        pass
+                        self.size = config["main"]["size"]
+                        self_test.assertEqual(self.size, (640, 480))
 
                     def start(self, **kwargs):
                         pass
@@ -202,7 +256,7 @@ class LoopTests(unittest.TestCase):
                         photo = sessions[0].state == State.CAPTURING
                         if photo:
                             requests.append(now[0])
-                        return Job(photo)
+                        return Job(photo, self.size)
 
                     def close(self):
                         pass
@@ -220,7 +274,7 @@ class LoopTests(unittest.TestCase):
                             return [pygame.event.Event(pygame.QUIT)]
                         if not started[0]:
                             started[0] = True
-                            return ((press(pygame.K_m) if mode == PhotoMode.PHOTO_STRIP else [])
+                            return ((press(pygame.K_m) if session.selected_mode != mode else [])
                                     + press(pygame.K_SPACE))
                         if session.error:
                             if stall:
@@ -229,6 +283,10 @@ class LoopTests(unittest.TestCase):
                     if session.state == State.REVIEW:
                         completed[0] = True
                         return press(pygame.K_SPACE)
+                    if cancel and not cancelled[0] and session.state == State.CAPTURING and requests:
+                        cancelled[0] = True
+                        started[0] = False
+                        return press(pygame.K_r)
                     return press(pygame.K_m) if session.state != State.IDLE else []
 
                 def tick(fps):
@@ -242,6 +300,7 @@ class LoopTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()), \
                         patch.dict(sys.modules, modules), \
                         patch.object(sys, "argv", ["photobooth.py", "--desktop", "--camera",
+                                                   "--camera-size", "640x480", "--live-size", "320x240",
                                                    "--output-dir", folder]), \
                         patch.object(photobooth, "Session", side_effect=create_session), \
                         patch.object(photobooth.time, "monotonic", side_effect=lambda: now[0]), \
@@ -249,7 +308,7 @@ class LoopTests(unittest.TestCase):
                         patch.object(pygame.event, "get", side_effect=events):
                     clock.return_value.tick.side_effect = tick
                     photobooth.main()
-                    self.assertEqual(len(requests), mode.count + int(fail_once))
+                    self.assertEqual(len(requests), mode.count + int(fail_once) + int(cancel))
                     self.assertEqual(len(list(Path(folder).glob("*.png"))), 0 if stall else 1)
                     self.assertEqual(sessions[0].selected_mode, mode)
                     self.assertEqual(sessions[0].state, State.IDLE)
@@ -262,11 +321,15 @@ class LoopTests(unittest.TestCase):
             (.1, pygame.KEYDOWN, pygame.K_m),
             (.2, pygame.KEYDOWN, pygame.K_m),  # Keyboard repeat while held.
             (.3, pygame.KEYUP, pygame.K_m),
+            (.31, pygame.KEYDOWN, pygame.K_f),
+            (.32, pygame.KEYUP, pygame.K_f),
             (.4, pygame.KEYDOWN, pygame.K_SPACE),
             (.5, pygame.KEYUP, pygame.K_SPACE),
             (1., pygame.KEYDOWN, pygame.K_m),  # Busy press held through return to IDLE.
             (2., pygame.KEYDOWN, pygame.K_SPACE),
             (2.1, pygame.KEYUP, pygame.K_SPACE),
+            (18., pygame.KEYDOWN, pygame.K_f),  # Change reviewed strip, reusing its file.
+            (18.1, pygame.KEYUP, pygame.K_f),
             (19., pygame.KEYDOWN, pygame.K_SPACE),  # Continue from strip review.
             (19.1, pygame.KEYUP, pygame.K_SPACE),
             (22., pygame.KEYDOWN, pygame.K_m),  # Still held: ignored.
@@ -301,6 +364,7 @@ class LoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(sys, "argv", ["photobooth.py", "--desktop", "--output-dir", folder]), \
                 patch.object(photobooth, "Session", side_effect=create_session), \
+                patch.object(photobooth, "save_output", wraps=save_output) as writer, \
                 patch.object(photobooth.time, "monotonic", side_effect=lambda: now[0]), \
                 patch.object(pygame.time, "Clock") as clock, \
                 patch.object(pygame.event, "get", side_effect=events):
@@ -308,6 +372,8 @@ class LoopTests(unittest.TestCase):
             photobooth.main()
             paths = list(Path(folder).glob("*.png"))
             self.assertEqual(len(paths), 2)
+            self.assertEqual([call.args[3] for call in writer.call_args_list],
+                             ["High Contrast", "Outline", "Outline"])
             sizes = []
             for path in paths:
                 with Image.open(path) as image:
@@ -316,7 +382,7 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(session_ref[0].selected_mode, PhotoMode.SINGLE_PHOTO)
         self.assertEqual(session_ref[0].state, State.REVIEW)
         # The mode band changes with the shared mode on the actual rendered surface.
-        band = (0, 54, 320, 20)
+        band = (0, 0, 160, 24)
         self.assertNotEqual(pygame.image.tostring(screenshots[PhotoMode.SINGLE_PHOTO].subsurface(band), "RGB"),
                             pygame.image.tostring(screenshots[PhotoMode.PHOTO_STRIP].subsurface(band), "RGB"))
 

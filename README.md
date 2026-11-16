@@ -68,14 +68,18 @@ system packages. Do not substitute the older `picamera` library.
 
 IDLE and COUNTDOWN show live video. Once the countdown finishes, CAPTURING
 requests a fresh frame and stores its own Pygame surface. The static image
-stays on screen during processing. REVIEW shows the original color photo in
-Single Photo mode or the completed monochrome strip in Photo Strip mode.
+stays on screen during processing. REVIEW shows a smooth preview of the selected
+photo or strip before printer dithering; Filter Off preserves color in review.
+The saved printer file remains monochrome, even with Filter Off.
 Retake resumes live video and restarts the entire selected sequence.
 Returning to IDLE resumes live video too. Continuous autofocus is enabled
 for the Camera Module 3.
 
-The camera stream and captured images are 320×240; the UI fits them within
-192×144 to leave room for controls. Original color frames remain in memory
+The camera stream defaults to 1280×960 (`--camera-size`); live filter processing
+defaults to 480×360 (`--live-size`). The UI fits previews within 256×192 between
+a slim top bar for mode/filter and a bottom status line. The idle preview has
+no text overlays; countdowns and temporary busy/error messages appear only
+when needed. Original color frames remain in memory
 during the session, as before. Completed print images are saved to `output/`
 beside the script, or the directory passed with `--output-dir PATH`. Each
 session gets a unique `-single.png` or `-strip.png` filename. Single outputs
@@ -116,22 +120,30 @@ switch drivers or framebuffers just to run this milestone.
 
 Controls (BCM GPIO numbers, not connector pin numbers):
 
-- **GPIO17:** shutter; continue to printing on the review screen.
-- **GPIO22:** retake on the review screen (starts a fresh countdown).
+- **GPIO26:** external shutter; continue to printing on the review screen.
+- **GPIO17:** cycle filters during IDLE, COUNTDOWN, or REVIEW.
+- **GPIO22:** stop an active sequence and return to IDLE; redo during REVIEW.
 - **GPIO23:** toggle Single Photo / Photo Strip (4), **only while IDLE**.
 - **GPIO27:** quit immediately, including while busy.
 - **Space:** simulated shutter / continue when keyboard events reach Pygame.
-- **R:** retake on the review screen.
+- **R:** same stop/redo action as GPIO22.
 - **M:** toggle modes while IDLE; release before pressing again.
+- **F / tap the top-right filter label:** cycle Photo, High Contrast, Outline, Invert,
+  and Off during IDLE, COUNTDOWN, or REVIEW. GPIO23 is reserved for mode changes.
 - **Escape / Q / window close / Ctrl+C:** quit.
+
+The external shutter uses **BCM GPIO26 (physical header pin 37)**. Configure
+it as an input with the internal pull-up (done by this program), and connect
+it through a 1 kOhm series resistor and the pushbutton to GND. Pressing the
+button pulls the input LOW. No external pull-up or 3.3 V connection is needed.
 
 GPIO23 (BCM numbering; connector pin 16) is the previously unused PiTFT
 button input in this project. `lab1/four_buttons.py` and the local pigame helper
 identify the same four PiTFT button GPIOs. `lab2/video_control.py` used GPIO23
 for video control and `lab3/rolling_control.py` used it for motor stop, but those
-are separate programs, not photobooth actions. Shutter GPIO17, retake GPIO22,
-and quit GPIO27 retain their assignments. The photobooth configures no motor
-pins; `lab4/test_rt_v16.c` uses GPIO26, not GPIO23. The camera uses its camera
+are separate programs, not photobooth actions. Capture/continue now uses external GPIO26, freeing PiTFT GPIO17 for filters.
+Retake GPIO22, mode GPIO23, and quit GPIO27 each retain a dedicated action. The photobooth configures no motor
+pins. The old lab GPIO26 LED circuit is not connected in this photobooth. The camera uses its camera
 connector and the planned printer is USB. No display/touchscreen pins are
 repurposed. This matches [Adafruit's four button GPIO assignments](https://learn.adafruit.com/adafruit-pitft-28-inch-resistive-touchscreen-display-raspberry-pi/overview).
 Run the photobooth by itself, as with the existing labs.
@@ -142,8 +154,8 @@ the existing application; GPIO23 and keyboard M now update the single shared
 
 ## Test without Pi hardware
 
-Desktop mode requires Pygame and Pillow. Install them in your chosen Python
-environment with `python -m pip install pygame Pillow` if needed.
+Desktop mode requires Pygame, Pillow, and NumPy. Install them in your chosen
+Python environment with `python -m pip install pygame Pillow numpy` if needed.
 
 ```powershell
 python photobooth.py --desktop
@@ -161,7 +173,7 @@ The explicit `State` Enum follows this sequence:
 ```text
 IDLE → COUNTDOWN (3 → 2 → 1) → CAPTURING (1 s)
      → PROCESSING (1 s) → REVIEW
-REVIEW → Continue (GPIO17 / Space) → PRINTING (2 s) → IDLE
+REVIEW → Continue (GPIO26 / Space) → PRINTING (2 s) → IDLE
 REVIEW → Retake (GPIO22 / R) → COUNTDOWN
 ```
 
@@ -178,20 +190,25 @@ the UI with `time.sleep()`. `clock.tick(30)` limits redraws to 30 FPS. The
 countdown displays `3 - int(elapsed)` during its three seconds.
 
 Each frame pumps the PiTFT helper (on the Pi), drains Pygame events, polls
-GPIO, advances the state, and redraws. GPIO17, GPIO22, and GPIO23 use
+GPIO, advances the state, and redraws. GPIO26, GPIO17, GPIO22, and GPIO23 use
 `RPi.GPIO.add_event_detect(..., GPIO.FALLING, bouncetime=50)` and nonblocking
 `event_detected()` polling, followed by the existing 50 ms stable-level debounce
 approach. No GPIO callback changes application state. A stable release is
 required before accepting another edge, so holding a button does not repeat.
 Eligibility is recorded when the edge is consumed as well as when debounce
 finishes: a busy press cannot become an IDLE action as the debounce completes.
+GPIO22/R is accepted during countdown, capture, processing, and simulated
+printing to stop the session without quitting. Stop takes priority over other
+actions, clears partial photos, and preserves mode/filter selection. A pending
+camera request is drained as a preview frame so it cannot become a photo in
+the next session. Completed files already saved are retained.
 Keyboard presses also require release before another press. Busy presses are
 consumed immediately and never queued for the next cycle.
 
 REVIEW waits indefinitely for a fresh button press, showing both choices.
 Retake restarts the countdown without printing; continue starts simulated
 printing. If both choices arrive in the same frame, retake takes priority.
-Without `--camera`, review is text-only. With `--camera`, it shows the captured photo.
+Without `--camera`, review shows the numbered sample images.
 
 `compose_output()` converts images to grayscale, applies identical centered
 4:3 crops to four 368×276 tiles, and pastes them in capture order on a white
@@ -203,14 +220,22 @@ save or print job. Composition is bounded to these small images and runs in
 the UI thread without new threads or sleeps. Slow storage can delay one frame;
 responsiveness on the Pi should be checked.
 
+The 384×1144 printer strip fits into only about 64×192 pixels on the PiTFT,
+leaving roughly 62×46 pixels per photo. `make_review_preview()` uses continuous
+tones, retains color for Filter Off, and downsamples with Lanczos rather than
+shrinking a 1-bit dither pattern. Cropping and print resizing also use Lanczos.
+Inspect the saved PNG on a larger display to judge the actual output; its
+black-and-white dots are expected for the thermal printer. The tiny review
+cannot establish camera focus quality.
+
 Manual checks:
 
 1. Confirm the title, shutter prompt, and **Mode: Single Photo** appear at startup.
-2. Press Space (or GPIO17 on the Pi). Confirm 3, 2, and 1 each appear for
+2. Press Space (or GPIO26 on the Pi). Confirm 3, 2, and 1 each appear for
    approximately one second, then capturing, processing, and the review screen.
 3. Wait on the review screen and confirm printing does not start automatically.
    Press R (or GPIO22) and confirm a new countdown starts without printing.
-4. On the next review screen, press Space (or GPIO17). Confirm printing runs
+4. On the next review screen, press Space (or GPIO26). Confirm printing runs
    for two seconds and returns to IDLE. Presses during timed stages must be
    ignored. Holding a choice button before review must require release and a
    new press before accepting that choice. Start another cycle from IDLE.
@@ -224,7 +249,7 @@ Manual checks:
    appears immediately after debounce. Hold the button: it must toggle only once.
    Release and press repeatedly: modes must alternate once per press. Restart
    the application and confirm Single Photo is the default again.
-8. Select Photo Strip, press GPIO17 once, and confirm four countdowns, each
+8. Select Photo Strip, press GPIO26 once, and confirm four countdowns, each
    followed by one capture. During countdown the UI shows `Photo N of 4`.
    Check that one `-strip.png` is saved and is 384×1144 with the photos in order.
    Continue and confirm simulated printing returns to IDLE in the same mode.
@@ -235,6 +260,11 @@ Manual checks:
 10. Switch back to Single Photo, capture, and check one `-single.png` (384×288).
     Retake a strip and confirm it restarts at photo 1. Inspect output files from
     desktop mode as well; those contain numbered sample photos.
+11. Press GPIO22/R during countdown and while waiting for a capture. Confirm
+    live preview returns without quitting, partial photos are discarded, and
+    the next shutter press starts at photo 1. On REVIEW, the same button must
+    restart the selected sequence. With Filter Off, review should retain color
+    while the saved printer PNG remains 1-bit.
 
 Automated checks from this directory:
 
