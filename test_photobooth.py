@@ -62,7 +62,8 @@ class SessionTests(unittest.TestCase):
     def test_default_toggle_persistence_and_busy_lock(self):
         session = Session(0)
         self.assertEqual(session.selected_mode, PhotoMode.SINGLE_PHOTO)
-        for expected in [PhotoMode.PHOTO_STRIP, PhotoMode.SINGLE_PHOTO, PhotoMode.PHOTO_STRIP]:
+        for expected in [PhotoMode.PHOTO_STRIP, PhotoMode.PHOTO_GRID,
+                         PhotoMode.SINGLE_PHOTO, PhotoMode.PHOTO_STRIP]:
             session.advance(1, mode=True)
             self.assertEqual(session.selected_mode, expected)
         session.advance(2)
@@ -113,7 +114,13 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.state, State.IDLE)
         self.assertEqual(session.selected_mode, PhotoMode.PHOTO_STRIP)
         session.advance(43., mode=True)
+        self.assertEqual(session.selected_mode, PhotoMode.PHOTO_GRID)
         self.run_capture(session, 44.)
+        session.advance(70., shutter=True)
+        session.advance(72.)
+        session.advance(73., mode=True)
+        self.assertEqual(session.selected_mode, PhotoMode.SINGLE_PHOTO)
+        self.run_capture(session, 74.)
 
     def test_failure_clears_partial_capture_and_allows_retry(self):
         session = Session(0)
@@ -144,6 +151,27 @@ class SessionTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_grid_dimensions_order_gaps_and_saved_output(self):
+        photos = [Image.new("RGB", (320, 240), (gray, gray, gray))
+                  for gray in (0, 85, 170, 255)]
+        grid = photobooth.compose_image(photos, PhotoMode.PHOTO_GRID)
+        self.assertEqual(grid.size, (384, 294))
+        for point, gray in zip(((98, 75), (286, 75), (98, 218), (286, 218)),
+                               (0, 85, 170, 255)):
+            self.assertEqual(grid.getpixel(point), gray)
+        for box in ((0, 0, 384, 8), (188, 0, 196, 294), (0, 143, 384, 151),
+                    (0, 286, 384, 294)):
+            self.assertEqual(grid.crop(box).getextrema(), (255, 255))
+        with tempfile.TemporaryDirectory() as folder:
+            path = save_output(photos, PhotoMode.PHOTO_GRID, folder)
+            self.assertTrue(path.name.endswith("-grid.png"))
+            with Image.open(path) as output:
+                self.assertEqual(output.size, (384, 294))
+                self.assertEqual(output.mode, "1")
+        preview = photobooth.make_review_preview(photos, PhotoMode.PHOTO_GRID)
+        self.assertLessEqual(preview.get_width(), 256)
+        self.assertEqual(preview.get_height(), 192)
+
     def test_review_is_continuous_tone_and_off_preserves_color(self):
         photo = Image.new("RGB", (320, 240), (180, 100, 60))
         preview = photobooth.make_review_preview([photo] * 4, PhotoMode.PHOTO_STRIP)
@@ -151,7 +179,7 @@ class OutputTests(unittest.TestCase):
         color = preview.get_at((32, 24))
         self.assertGreater(color.r, color.g)
         self.assertGreater(color.g, color.b)
-        preview = photobooth.make_review_preview([photo] * 4, PhotoMode.PHOTO_STRIP, "Photo")
+        preview = photobooth.make_review_preview([photo] * 4, PhotoMode.PHOTO_STRIP, "High Contrast")
         color = preview.get_at((32, 24))
         self.assertEqual(color.r, color.g)
         self.assertEqual(color.g, color.b)
@@ -174,7 +202,7 @@ class OutputTests(unittest.TestCase):
                 self.assertEqual(strip.size, (384, 1144))
                 self.assertEqual(strip.mode, "1")
         self.assertEqual(pygame.image.tostring(surface, "RGB"), original)
-        self.assertNotEqual(compose_output([photo], PhotoMode.SINGLE_PHOTO, "Photo").tobytes(),
+        self.assertNotEqual(compose_output([photo], PhotoMode.SINGLE_PHOTO).tobytes(),
                             compose_output([photo], PhotoMode.SINGLE_PHOTO, "Invert").tobytes())
 
     def test_strip_size_order_margins_and_monochrome(self):
@@ -208,6 +236,7 @@ class LoopTests(unittest.TestCase):
     def test_async_camera_capture_counts_and_retry_after_driver_error(self):
         for mode, fail_once, stall, cancel in [(PhotoMode.SINGLE_PHOTO, False, False, False),
                                               (PhotoMode.PHOTO_STRIP, False, False, False),
+                                              (PhotoMode.PHOTO_GRID, False, False, False),
                                               (PhotoMode.PHOTO_STRIP, True, False, False),
                                               (PhotoMode.SINGLE_PHOTO, False, True, False),
                                               (PhotoMode.PHOTO_STRIP, False, False, True)]:
@@ -273,9 +302,10 @@ class LoopTests(unittest.TestCase):
                         if completed[0]:
                             return [pygame.event.Event(pygame.QUIT)]
                         if not started[0]:
+                            if session.selected_mode != mode:
+                                return press(pygame.K_m)
                             started[0] = True
-                            return ((press(pygame.K_m) if session.selected_mode != mode else [])
-                                    + press(pygame.K_SPACE))
+                            return press(pygame.K_SPACE)
                         if session.error:
                             if stall:
                                 return [pygame.event.Event(pygame.QUIT)]
@@ -336,6 +366,8 @@ class LoopTests(unittest.TestCase):
             (22.1, pygame.KEYUP, pygame.K_m),
             (22.2, pygame.KEYDOWN, pygame.K_m),
             (22.3, pygame.KEYUP, pygame.K_m),
+            (22.31, pygame.KEYDOWN, pygame.K_m),  # Grid -> Single Photo.
+            (22.32, pygame.KEYUP, pygame.K_m),
             (22.4, pygame.KEYDOWN, pygame.K_SPACE),
             (22.5, pygame.KEYUP, pygame.K_SPACE),
             (29., pygame.QUIT, None),

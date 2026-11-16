@@ -3,8 +3,8 @@
 A 320×240 Pygame interface for the Raspberry Pi 4 and existing PiTFT setup.
 With `--camera`, the Camera Module 3 supplies a live preview and a captured
 photo for review. Without that option, capture uses labeled sample images and no
-camera is required. Single Photo is the default; Photo Strip captures four photos
-after one shutter press. Processing saves a monochrome PNG. Printing remains
+camera is required. Single Photo is the default; Photo Strip and Photo Grid each capture four
+photos after one shutter press, then arrange them vertically or in a 2x2 grid. Processing saves a monochrome PNG. Printing remains
 **only a timed message**, with no printer communication.
 
 ## Lab references
@@ -82,8 +82,8 @@ no text overlays; countdowns and temporary busy/error messages appear only
 when needed. Original color frames remain in memory
 during the session, as before. Completed print images are saved to `output/`
 beside the script, or the directory passed with `--output-dir PATH`. Each
-session gets a unique `-single.png` or `-strip.png` filename. Single outputs
-are 384×288; strips are 384×1144. Higher-resolution capture and real printing
+session gets a unique `-single.png`, `-strip.png`, or `-grid.png` filename. Single outputs
+are 384×288; strips are 384×1144; grids are 384×294. Higher-resolution capture and real printing
 are not implemented.
 
 Pygame owns the PiTFT display; Picamera2 does not open another preview window.
@@ -120,16 +120,22 @@ switch drivers or framebuffers just to run this milestone.
 
 Controls (BCM GPIO numbers, not connector pin numbers):
 
+Small labels in the existing left margin align with the PiTFT buttons:
+top-to-bottom **Quit (27), Mode (23), Stop/Redo (22), Filter (17)**.
+The GPIO22 label shows Stop during an active session and Redo otherwise;
+unavailable actions are dimmed. The labels stay outside the camera preview.
+
 - **GPIO26:** external shutter; continue to printing on the review screen.
 - **GPIO17:** cycle filters during IDLE, COUNTDOWN, or REVIEW.
 - **GPIO22:** stop an active sequence and return to IDLE; redo during REVIEW.
-- **GPIO23:** toggle Single Photo / Photo Strip (4), **only while IDLE**.
+- **GPIO23:** cycle Single Photo / Photo Strip (4) / Photo Grid (4), **only while IDLE**.
 - **GPIO27:** quit immediately, including while busy.
 - **Space:** simulated shutter / continue when keyboard events reach Pygame.
 - **R:** same stop/redo action as GPIO22.
 - **M:** toggle modes while IDLE; release before pressing again.
-- **F / tap the top-right filter label:** cycle Photo, High Contrast, Outline, Invert,
-  and Off during IDLE, COUNTDOWN, or REVIEW. GPIO23 is reserved for mode changes.
+- **F / tap the top-right filter label:** cycle Off, High Contrast, Outline,
+  Invert, and back to Off during IDLE, COUNTDOWN, or REVIEW. Startup defaults
+  to Off. GPIO23 is reserved for mode changes.
 - **Escape / Q / window close / Ctrl+C:** quit.
 
 The external shutter uses **BCM GPIO26 (physical header pin 37)**. Configure
@@ -177,7 +183,7 @@ REVIEW → Continue (GPIO26 / Space) → PRINTING (2 s) → IDLE
 REVIEW → Retake (GPIO22 / R) → COUNTDOWN
 ```
 
-In Photo Strip mode, CAPTURING appends exactly one completed photo and returns
+In Photo Strip and Photo Grid modes, CAPTURING appends exactly one completed photo and returns
 to COUNTDOWN until four photos have been collected. Only then does it enter
 PROCESSING, save one combined PNG, and enter REVIEW. A retake clears the whole
 collection and begins again. The mode remains selected after printing or retake;
@@ -247,7 +253,7 @@ Manual checks:
    Check focus, colors, orientation, and quit while waiting for a camera frame.
 7. From IDLE, press GPIO23 (M on desktop) once. Confirm **Mode: Photo Strip (4)**
    appears immediately after debounce. Hold the button: it must toggle only once.
-   Release and press repeatedly: modes must alternate once per press. Restart
+   Release and press repeatedly: modes must cycle Single Photo / Strip (4) / Grid (4) once per press. Restart
    the application and confirm Single Photo is the default again.
 8. Select Photo Strip, press GPIO26 once, and confirm four countdowns, each
    followed by one capture. During countdown the UI shows `Photo N of 4`.
@@ -286,3 +292,17 @@ Actual display routing, orientation, physical button wiring/debouncing, and
 touchscreen-helper shutdown, camera detection, autofocus, colors, and live-preview
 performance must be checked on the Raspberry Pi. Desktop
 testing cannot verify those hardware behaviors.
+
+## Four-photo grid mode
+
+From IDLE, press GPIO23 / M to cycle Single Photo -> Strip (4) -> Grid (4)
+-> Single Photo. Both four-photo modes use the same four countdown/capture
+cycles, stop/redo controls, and filter selection. Grid mode saves one
+384x294 monochrome `-grid.png`, with 180x135 tiles, 8-pixel margins and gaps,
+and the same centered 4:3 crop as strip mode. Capture order is top-left,
+top-right, bottom-left, bottom-right. Review uses the smooth preview as before.
+
+On the Pi, select Grid (4), press the external GPIO26 shutter once, and check
+four captures and one grid output. Test stop and redo, then cycle back to
+Single Photo. Automated checks cover grid capture count, cycling back to
+Single Photo, tile order, spacing, dimensions, preview, and saved PNG format.

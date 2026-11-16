@@ -1,4 +1,4 @@
-"""PiTFT single-photo/strip capture, PNG output, and simulated printing."""
+"""PiTFT single-photo, strip, and grid capture with simulated printing."""
 
 import argparse
 from enum import Enum, auto
@@ -21,7 +21,7 @@ RETAKE_PIN = 22
 MODE_PIN = 23
 QUIT_PIN = 27
 BUTTON_PINS = [SHUTTER_PIN, FILTER_PIN, RETAKE_PIN, MODE_PIN, QUIT_PIN]
-FILTER_NAMES = ("Photo", "High Contrast", "Outline", "Invert")
+FILTER_NAMES = ("High Contrast", "Outline", "Invert")
 FILTER_STEPS = len(FILTER_NAMES) + 1  # Final step is Off.
 DEBOUNCE_SECONDS = 0.05
 FPS = 30
@@ -31,10 +31,11 @@ CAMERA_TIMEOUT_SECONDS = 10.0
 class PhotoMode(Enum):
     SINGLE_PHOTO = "Single Photo"
     PHOTO_STRIP = "Photo Strip (4)"
+    PHOTO_GRID = "Photo Grid (4)"
 
     @property
     def count(self):
-        return 4 if self == PhotoMode.PHOTO_STRIP else 1
+        return 1 if self == PhotoMode.SINGLE_PHOTO else 4
 
 
 class DebouncedButton:
@@ -196,12 +197,16 @@ def compose_image(photos, mode, filter_name=None, color=False):
                              Image.Resampling.LANCZOS)
     else:
         margin, gap = 8, 8
-        width, height = 368, 276  # Identical centered 4:3 crops.
+        columns = 2 if mode == PhotoMode.PHOTO_GRID else 1
+        rows = mode.count // columns
+        width = (384 - 2 * margin - (columns - 1) * gap) // columns
+        height = width * 3 // 4  # Identical centered 4:3 crops.
         image = Image.new("RGB" if color else "L",
-                          (384, 2 * margin + 4 * height + 3 * gap), "white")
+                          (384, 2 * margin + rows * height + (rows - 1) * gap), "white")
         for index, photo in enumerate(photos):
             crop = ImageOps.fit(photo, (width, height), method=Image.Resampling.LANCZOS)
-            image.paste(crop, (margin, margin + index * (height + gap)))
+            row, column = divmod(index, columns)
+            image.paste(crop, (margin + column * (width + gap), margin + row * (height + gap)))
     return image
 
 
@@ -221,8 +226,10 @@ def make_review_preview(photos, mode, filter_name=None):
 def save_output(photos, mode, output_dir, filter_name=None, path=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = {PhotoMode.SINGLE_PHOTO: "single", PhotoMode.PHOTO_STRIP: "strip",
+              PhotoMode.PHOTO_GRID: "grid"}[mode]
     path = path or output_dir / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
-                         + ("-strip.png" if mode == PhotoMode.PHOTO_STRIP else "-single.png"))
+                                + "-" + suffix + ".png")
     compose_output(photos, mode, filter_name).save(path)
     return path
 
@@ -264,9 +271,8 @@ class Session:
         elapsed = now - self.state_started
         if self.state == State.IDLE:
             if mode:
-                self.selected_mode = (PhotoMode.PHOTO_STRIP
-                                      if self.selected_mode == PhotoMode.SINGLE_PHOTO
-                                      else PhotoMode.SINGLE_PHOTO)
+                modes = tuple(PhotoMode)
+                self.selected_mode = modes[(modes.index(self.selected_mode) + 1) % len(modes)]
             if shutter:
                 self.photos.clear()
                 self.output_path = None
@@ -294,7 +300,7 @@ class Session:
 
 
 def draw_ui(screen, session, filter_index, image, font_small, font_message,
-            font_countdown, now, camera_failed=False):
+            font_countdown, now, camera_failed=False, font_button=None):
     """Reserve the header/footer for labels; leave the live image unobstructed."""
     screen.fill(BLACK)
     if image is not None:
@@ -303,26 +309,42 @@ def draw_ui(screen, session, filter_index, image, font_small, font_message,
 
     header = (24, 24, 24)
     pygame.draw.rect(screen, header, (0, 0, 320, 24))
-    mode = "Single Photo" if session.selected_mode == PhotoMode.SINGLE_PHOTO else "Strip (4)"
+    mode = {PhotoMode.SINGLE_PHOTO: "Single Photo", PhotoMode.PHOTO_STRIP: "Strip (4)",
+            PhotoMode.PHOTO_GRID: "Grid (4)"}[session.selected_mode]
     label = font_small.render("Mode: " + mode, True, WHITE)
     screen.blit(label, label.get_rect(midleft=(8, 12)))
     label = font_small.render("Filter: " + filter_label(filter_index), True, GRAY)
     screen.blit(label, label.get_rect(midright=(312, 12)))
 
     state = session.state
+    # Physical buttons run bottom-to-top: GPIO17, GPIO22, GPIO23, GPIO27.
+    # These labels occupy the existing 32-pixel gutter, outside the preview.
+    active_session = state in (State.COUNTDOWN, State.CAPTURING, State.PROCESSING, State.PRINTING)
+    button_labels = (
+        ("Quit", 36, True),
+        ("Mode", 92, state == State.IDLE),
+        ("Stop" if active_session else "Redo", 148, active_session or state == State.REVIEW),
+        ("Filter", 204, state in (State.IDLE, State.COUNTDOWN, State.REVIEW)),
+    )
+    for caption, y, enabled in button_labels:
+        color = GRAY if enabled else (70, 70, 70)
+        pygame.draw.line(screen, color, (0, y), (2, y))
+        text = (font_button or font_small).render(caption, True, color)
+        screen.blit(text, text.get_rect(midleft=(4, y)))
     elapsed = now - session.state_started
     message = None
     status = "Ready"
     if state == State.COUNTDOWN:
         message = str(max(1, 3 - int(elapsed)))
-        status = "Photo {} of {}   22: stop".format(len(session.photos) + 1, session.selected_mode.count)
+        status = "Photo {} of {}".format(len(session.photos) + 1, session.selected_mode.count)
     elif state == State.CAPTURING:
-        status = "Capturing {} of {}   22: stop".format(len(session.photos) + 1, session.selected_mode.count)
+        status = "Capturing {} of {}".format(len(session.photos) + 1, session.selected_mode.count)
     elif state == State.PROCESSING:
         message = "Processing..."
-        status = "Making your photo strip" if session.selected_mode == PhotoMode.PHOTO_STRIP else "Preparing photo"
+        status = {PhotoMode.SINGLE_PHOTO: "Preparing photo", PhotoMode.PHOTO_STRIP: "Making your photo strip",
+                  PhotoMode.PHOTO_GRID: "Making your photo grid"}[session.selected_mode]
     elif state == State.REVIEW:
-        status = "Shutter: continue    Retake: retry"
+        status = "Shutter: continue"
     elif state == State.PRINTING:
         message = "Printing..."
         status = "Print simulation"
@@ -400,6 +422,7 @@ def main():
         font_title = pygame.font.Font(None, 30)
         font_message = pygame.font.Font(None, 30)
         font_small = pygame.font.Font(None, 18)
+        font_button = pygame.font.Font(None, 14)
         font_countdown = pygame.font.Font(None, 88)
         clock = pygame.time.Clock()
 
@@ -419,7 +442,7 @@ def main():
 
         live_frame = None
         live_filtered_frame = None
-        filter_index = 0
+        filter_index = len(FILTER_NAMES)  # Start with Off; the next press selects High Contrast.
         filter_touch = pygame.Rect(FILTER_TOUCH)
         review_photo = None
         frame_job = None
@@ -581,7 +604,7 @@ def main():
                      else review_photo if state in (State.REVIEW, State.PRINTING)
                      else session.photo)
             draw_ui(screen, session, filter_index, image, font_small, font_message,
-                    font_countdown, now, camera_failed)
+                    font_countdown, now, camera_failed, font_button)
             pygame.display.flip()
             clock.tick(FPS)
 
